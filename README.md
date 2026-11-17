@@ -8,7 +8,7 @@
 
 ## What is Maxine?
 
-Maxine is a wireless, modular, bedside patient monitoring system built on the ESP32 microcontroller and MicroPython. It monitors heart rate, SpO₂, temperature, blood pressure, and respiratory rate — displaying them on a low-power e-paper screen and streaming them via Bluetooth LE.
+Maxine is a wireless, modular, bedside patient monitoring system built on the ESP32 microcontroller and MicroPython. It watches heart rate, skin temperature, breathing and blood pressure through the night, with a first focus on autonomic dysreflexia: the sudden, dangerous blood pressure spikes that people with spinal cord injuries at T6 and above can have, often while asleep.
 
 It began as a clinical question: after building a voice-activated hospital bed control system for quadriplegic patients in Puerto Rico (sponsored by [Volunteers for Medical Engineering](https://imagemd.org/services/medical-engineering/volunteer/)), we asked — *what comes after the bed?* Maxine is the answer we're still building.
 
@@ -16,147 +16,106 @@ It began as a clinical question: after building a voice-activated hospital bed c
 
 ---
 
+## What works today
+
+The software side runs and is tested on a laptop; the firmware has not yet been run on the bench.
+
+| Part | Status |
+|---|---|
+| Signal processing (`firmware/shared/vitals.py`): heart rate from a pulse waveform, respiration from chest motion, HRV, motion level | Tested on synthetic signals |
+| Autonomic dysreflexia watch (`firmware/shared/ad_monitor.py`): learns a personal baseline, asks the cuff for a reading when heart rate or skin temperature turns, alerts only on a measured systolic rise | Tested; thresholds from Can-SCIP guidance |
+| Safety supervisor (`firmware/shared/supervisor.py`): stale sensors, lost link and low battery are shown as faults, never as calm | Tested |
+| BLE packet (`firmware/shared/ble_protocol.py`): 16 bytes, CRC-8, missing values sent as "unknown" rather than zero | Tested |
+| Wearable and bedside firmware (`firmware/wearable`, `firmware/bedside`) | Written, compiles, bench-untested |
+| Night replay (`tools/replay.py`) | Runs the real alert logic over a simulated night |
+
+![A simulated autonomic dysreflexia episode replayed through MAXINE](docs/replay-ad-episode.png)
+
+*Synthetic replay: as heart rate falls and skin temperature rises, MAXINE asks the cuff for readings and alerts once systolic pressure crosses baseline + 20 mmHg, then re-checks every two minutes until it settles.*
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q                                   # 19 tests
+python tools/replay.py ad_episode --plot    # also: normal_night, sensor_dropout
+```
+
+---
+
 ## Architecture
 
-Maxine is a two-unit system:
+Two units. The wearable senses; the bedside unit decides, measures blood pressure and alerts.
 
 ```
-┌─────────────────────────┐        BLE        ┌─────────────────────────┐
-│     Wearable unit       │ ◄───────────────► │     Bedside unit        │
-│  (patient-worn)         │                   │  (mains-powered)        │
-│                         │                   │                         │
-│  MAX30102  HR + SpO₂    │                   │  MLX90614  Temperature  │
-│  MPU-6050  Respiration  │                   │  BP cuff   Blood press. │
-│  LiPo battery           │                   │  E-paper display        │
-│  ESP32-WROOM-32E        │                   │  SD card logging        │
-│                         │                   │  ESP32-WROOM-32E        │
-└─────────────────────────┘                   └─────────────────────────┘
+┌─────────────────────────┐   BLE, 1 packet / 5 s  ┌─────────────────────────┐
+│     Wearable unit       │ ─────────────────────► │     Bedside unit        │
+│  MAX30102  pulse        │                        │  AD monitor + supervisor│
+│  MLX90614  skin temp    │                        │  BP cuff (ground truth) │
+│  MPU-6050  breathing    │                        │  E-paper display        │
+│  ESP32 + LiPo           │                        │  Buzzer, ESP32          │
+└─────────────────────────┘                        └─────────────────────────┘
 ```
+
+**Where it is heading (v2).** A chest unit with ECG and bioimpedance (MAX30001), a contact temperature sensor (MAX30208) and an IMU, and a bedside unit built around a validated cuff (A&D UA-651BLE or SunTech) and clinical-grade SpO₂ (Nonin or Masimo modules). The shared code above is written so those parts slot in behind the same functions.
 
 ---
 
-## Hardware — Bill of Materials (~$120 total)
+## Hardware
 
-| Component | Part | Cost |
-|---|---|---|
-| ESP32-WROOM-32E (×2) | SDATEKIT dev board | ~$14 |
-| MAX30102 pulse oximeter | KOOBOOK 2-pack | ~$10 |
-| MLX90614 IR temp sensor | GY-906 | ~$8 |
-| MPU-6050 IMU | GY-521 3-pack | ~$9 |
-| Blood pressure cuff (UART) | Oscillometric module | ~$25–40 |
-| Waveshare 4.2" e-paper | EPD 4.2 V2 | ~$18 |
-| Micro SD card module | SPI 3.3V | ~$7 |
-| 32GB micro SD card | Class 10 | ~$8 |
-| 5V 2A USB-C power supply | Wall adapter | ~$8 |
-| 3.7V LiPo 2000mAh | JST connector | ~$12 (optional) |
-| Breadboard + jumper kit | 830pt | ~$10 |
-
-See [`hardware/BOM.md`](hardware/BOM.md) for full details, wiring diagrams, and pin assignments.
+Prototype v1 is about $140 of parts. See [`BOM.md`](BOM.md) for the list and [`docs/WIRING.md`](docs/WIRING.md) for pins.
 
 ---
 
-## Firmware Structure
+## Firmware layout
 
 ```
 firmware/
-├── shared/               # Copied to BOTH ESP32 units
-│   ├── base.py           # BaseSensor abstract class
-│   ├── sensor_manager.py # SensorManager: register, boot, tick, dispatch
-│   └── ble_protocol.py   # Shared BLE UUIDs + packet encoding
-│
-├── wearable/             # Flashed to the patient-worn ESP32
-│   ├── main.py           # Entry point: sensor bridge + BLE peripheral
-│   ├── ble_peripheral.py # GATT server, advertises as "Maxine-W"
-│   └── sensors/
-│       ├── heart_rate.py # MAX30102 driver (HR + SpO₂)
-│       ├── temperature.py# MLX90614 driver (IR non-contact)
-│       └── respiration.py# MPU-6050 / ADC strain gauge driver
-│
-└── bedside/              # Flashed to the bedside ESP32
-    ├── main.py           # Entry point: BLE central + display + logging
-    ├── blood_pressure.py # Oscillometric UART cuff driver
-    ├── ble/
-    │   └── ble_central.py# Scans, connects, subscribes to wearable
-    └── display/
-        └── epaper.py     # Waveshare 4.2" vitals dashboard driver
+├── shared/                # Copied to BOTH units; also what the tests run
+│   ├── vitals.py          # heart rate, respiration, HRV, motion
+│   ├── ad_monitor.py      # autonomic dysreflexia watch, cuff in the loop
+│   ├── supervisor.py      # stale data, link and battery faults
+│   ├── ble_protocol.py    # 16-byte vitals packet, UUIDs, CRC
+│   ├── sensor_manager.py  # fixed-size rolling sample windows
+│   └── base.py            # MicroPython / CPython differences
+├── wearable/
+│   ├── main.py            # sample, compute every 5 s, send
+│   ├── ble_peripheral.py
+│   └── sensors/           # max30102.py, temperature.py, motion.py
+└── bedside/
+    ├── main.py            # receive, watch, cuff, display, alarm
+    ├── blood_pressure.py  # UART cuff parser (adapt to your module)
+    ├── ble/ble_central.py
+    └── display/epaper.py
 ```
+
+Everything in `shared/` uses only the Python subset MicroPython supports, so the code that ships on the device is the code the tests check.
 
 ---
 
-## Getting Started
+## Getting started on hardware
 
-### 1. Flash MicroPython
-
-Download the ESP32 MicroPython firmware from [micropython.org](https://micropython.org/download/ESP32_GENERIC/) and flash both boards:
-
-```bash
-pip install esptool
-esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
-esptool.py --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x1000 ESP32_GENERIC.bin
-```
-
-### 2. Install aioble (BLE library)
-
-Connect each ESP32 to WiFi and run in the MicroPython REPL:
-
-```python
-import mip
-mip.install("aioble")
-```
-
-### 3. Upload firmware files
-
-Use [mpremote](https://docs.micropython.org/en/latest/reference/mpremote.html) or [Thonny IDE](https://thonny.org) to upload files.
-
-**Wearable unit:**
-```bash
-mpremote connect /dev/ttyUSB0 cp firmware/shared/base.py :base.py
-mpremote connect /dev/ttyUSB0 cp firmware/shared/sensor_manager.py :sensor_manager.py
-mpremote connect /dev/ttyUSB0 cp firmware/shared/ble_protocol.py :ble_protocol.py
-mpremote connect /dev/ttyUSB0 cp -r firmware/wearable/ :/
-```
-
-**Bedside unit:**
-```bash
-mpremote connect /dev/ttyUSB1 cp firmware/shared/base.py :base.py
-mpremote connect /dev/ttyUSB1 cp firmware/shared/sensor_manager.py :sensor_manager.py
-mpremote connect /dev/ttyUSB1 cp firmware/shared/ble_protocol.py :ble_protocol.py
-mpremote connect /dev/ttyUSB1 cp -r firmware/bedside/ :/
-```
-
-### 4. Install e-paper display driver
-
-Download `epaper4in2.py` from [mcauser/micropython-waveshare-epaper](https://github.com/mcauser/micropython-waveshare-epaper) and upload it to the bedside ESP32.
-
-### 5. Wire up sensors
-
-See [`hardware/WIRING.md`](hardware/WIRING.md) for full pin-by-pin diagrams.
-
-**Quick reference — shared I2C bus (both sensors):**
-| Signal | ESP32 GPIO |
-|---|---|
-| SDA | 21 |
-| SCL | 22 |
-
-**E-paper (SPI):**
-| Signal | ESP32 GPIO |
-|---|---|
-| MOSI | 23 |
-| SCK | 18 |
-| CS | 5 |
-| DC | 17 |
-| RST | 16 |
-| BUSY | 4 |
+1. **Flash MicroPython** on both ESP32 boards ([micropython.org](https://micropython.org/download/ESP32_GENERIC/)):
+   ```bash
+   pip install esptool mpremote
+   esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
+   esptool.py --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x1000 ESP32_GENERIC.bin
+   ```
+2. **Upload the wearable:**
+   ```bash
+   mpremote connect /dev/ttyUSB0 cp -r firmware/shared/ : + cp -r firmware/wearable/sensors/ : \
+     + cp firmware/wearable/ble_peripheral.py : + cp firmware/wearable/main.py :
+   ```
+3. **Upload the bedside**, plus `epaper4in2.py` from [mcauser/micropython-waveshare-epaper](https://github.com/mcauser/micropython-waveshare-epaper):
+   ```bash
+   mpremote connect /dev/ttyUSB1 cp -r firmware/shared/ : + cp -r firmware/bedside/ble/ : \
+     + cp -r firmware/bedside/display/ : + cp firmware/bedside/blood_pressure.py : + cp firmware/bedside/main.py :
+   ```
+4. **Wire it** per [`docs/WIRING.md`](docs/WIRING.md). Without a screen attached, the bedside unit prints vitals to the serial console.
 
 ---
 
 ## Website & Research Dashboard
 
-The `web/` directory contains the public-facing project site and the internal research dashboard. Both are static HTML — no build step required.
-
-To host on GitHub Pages: enable Pages in your repository settings and set the source to the `web/` folder (or copy files to root).
-
-Visit the live site: **[your-username.github.io/maxine](https://github.com)**
+`index.html`, `origin.html` and `dashboard.html` are the project site and the research dashboard. Static HTML, no build step.
 
 ---
 

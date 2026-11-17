@@ -27,3 +27,7 @@ hardware/enclosures/*.stl
 logs/
 *.csv
 *.log
+# replay output
+replay_*.png
+__pycache__/
+.pytest_cache/
